@@ -26,41 +26,38 @@ import org.apache.flink.api.common.cache.DistributedCache;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.client.program.ClusterClient;
-import org.apache.flink.client.program.NewClusterClient;
+import org.apache.flink.client.program.DetachedJobExecutionResult;
 import org.apache.flink.client.program.ProgramInvocationException;
 import org.apache.flink.client.program.rest.retry.ExponentialWaitStrategy;
 import org.apache.flink.client.program.rest.retry.WaitStrategy;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.akka.AkkaUtils;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.runtime.client.JobSubmissionException;
-import org.apache.flink.runtime.clusterframework.messages.GetClusterStatusResponse;
 import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.concurrent.ScheduledExecutorServiceAdapter;
+import org.apache.flink.runtime.highavailability.ClientHighAvailabilityServices;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobStatus;
 import org.apache.flink.runtime.jobmaster.JobResult;
-import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalException;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.rest.FileUpload;
 import org.apache.flink.runtime.rest.RestClient;
 import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationInfo;
 import org.apache.flink.runtime.rest.handler.async.TriggerResponse;
-import org.apache.flink.runtime.rest.handler.job.rescaling.RescalingStatusHeaders;
-import org.apache.flink.runtime.rest.handler.job.rescaling.RescalingStatusMessageParameters;
-import org.apache.flink.runtime.rest.handler.job.rescaling.RescalingTriggerHeaders;
-import org.apache.flink.runtime.rest.handler.job.rescaling.RescalingTriggerMessageParameters;
 import org.apache.flink.runtime.rest.messages.EmptyMessageParameters;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.EmptyResponseBody;
 import org.apache.flink.runtime.rest.messages.JobAccumulatorsHeaders;
 import org.apache.flink.runtime.rest.messages.JobAccumulatorsInfo;
 import org.apache.flink.runtime.rest.messages.JobAccumulatorsMessageParameters;
+import org.apache.flink.runtime.rest.messages.JobCancellationHeaders;
+import org.apache.flink.runtime.rest.messages.JobCancellationMessageParameters;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
-import org.apache.flink.runtime.rest.messages.JobTerminationHeaders;
-import org.apache.flink.runtime.rest.messages.JobTerminationMessageParameters;
 import org.apache.flink.runtime.rest.messages.JobsOverviewHeaders;
 import org.apache.flink.runtime.rest.messages.MessageHeaders;
 import org.apache.flink.runtime.rest.messages.MessageParameters;
@@ -85,13 +82,13 @@ import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointStatusMess
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointTriggerHeaders;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointTriggerMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointTriggerRequestBody;
+import org.apache.flink.runtime.rest.messages.job.savepoints.stop.StopWithSavepointRequestBody;
+import org.apache.flink.runtime.rest.messages.job.savepoints.stop.StopWithSavepointTriggerHeaders;
 import org.apache.flink.runtime.rest.messages.queue.AsynchronouslyCreatedResource;
 import org.apache.flink.runtime.rest.messages.queue.QueueStatus;
 import org.apache.flink.runtime.rest.util.RestClientException;
 import org.apache.flink.runtime.rest.util.RestConstants;
 import org.apache.flink.runtime.util.ExecutorThreadFactory;
-import org.apache.flink.runtime.util.LeaderConnectionInfo;
-import org.apache.flink.runtime.util.LeaderRetrievalUtils;
 import org.apache.flink.runtime.webmonitor.retriever.LeaderRetriever;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.ExecutorUtils;
@@ -112,6 +109,7 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -131,9 +129,12 @@ import java.util.stream.Collectors;
 /**
  * A {@link ClusterClient} implementation that communicates via HTTP REST requests.
  */
-public class RestClusterClient<T> extends ClusterClient<T> implements NewClusterClient {
+public class RestClusterClient<T> extends ClusterClient<T> {
 
 	private final RestClusterClientConfiguration restClusterClientConfiguration;
+
+	/** Timeout for futures. */
+	private final Duration timeout;
 
 	private final RestClient restClient;
 
@@ -143,13 +144,11 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 
 	private final T clusterId;
 
+	private final ClientHighAvailabilityServices clientHAServices;
+
 	private final LeaderRetrievalService webMonitorRetrievalService;
 
-	private final LeaderRetrievalService dispatcherRetrievalService;
-
 	private final LeaderRetriever webMonitorLeaderRetriever = new LeaderRetriever();
-
-	private final LeaderRetriever dispatcherLeaderRetriever = new LeaderRetriever();
 
 	/** ExecutorService to run operations that can be retried on exceptions. */
 	private ScheduledExecutorService retryExecutorService;
@@ -159,30 +158,19 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 			config,
 			null,
 			clusterId,
-			new ExponentialWaitStrategy(10L, 2000L),
-			null);
-	}
-
-	public RestClusterClient(
-			Configuration config,
-			T clusterId,
-			LeaderRetrievalService webMonitorRetrievalService) throws Exception {
-		this(
-			config,
-			null,
-			clusterId,
-			new ExponentialWaitStrategy(10L, 2000L),
-			webMonitorRetrievalService);
+			new ExponentialWaitStrategy(10L, 2000L));
 	}
 
 	@VisibleForTesting
 	RestClusterClient(
-			Configuration configuration,
-			@Nullable RestClient restClient,
-			T clusterId,
-			WaitStrategy waitStrategy,
-			@Nullable LeaderRetrievalService webMonitorRetrievalService) throws Exception {
+		Configuration configuration,
+		@Nullable RestClient restClient,
+		T clusterId,
+		WaitStrategy waitStrategy) throws Exception {
 		super(configuration);
+
+		this.timeout = AkkaUtils.getClientTimeout(configuration);
+
 		this.restClusterClientConfiguration = RestClusterClientConfiguration.fromConfiguration(configuration);
 
 		if (restClient != null) {
@@ -194,23 +182,19 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 		this.waitStrategy = Preconditions.checkNotNull(waitStrategy);
 		this.clusterId = Preconditions.checkNotNull(clusterId);
 
-		if (webMonitorRetrievalService == null) {
-			this.webMonitorRetrievalService = highAvailabilityServices.getWebMonitorLeaderRetriever();
-		} else {
-			this.webMonitorRetrievalService = webMonitorRetrievalService;
-		}
-		this.dispatcherRetrievalService = highAvailabilityServices.getDispatcherLeaderRetriever();
+		this.clientHAServices = HighAvailabilityServicesUtils.createClientHAService(configuration);
+
+		this.webMonitorRetrievalService = clientHAServices.getClusterRestEndpointLeaderRetriever();
 		this.retryExecutorService = Executors.newSingleThreadScheduledExecutor(new ExecutorThreadFactory("Flink-RestClusterClient-Retry"));
 		startLeaderRetrievers();
 	}
 
 	private void startLeaderRetrievers() throws Exception {
 		this.webMonitorRetrievalService.start(webMonitorLeaderRetriever);
-		this.dispatcherRetrievalService.start(dispatcherLeaderRetriever);
 	}
 
 	@Override
-	public void shutdown() {
+	public void close() {
 		ExecutorUtils.gracefulShutdown(restClusterClientConfiguration.getRetryDelay(), TimeUnit.MILLISECONDS, retryExecutorService);
 
 		this.restClient.shutdown(Time.seconds(5));
@@ -219,20 +203,19 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 		try {
 			webMonitorRetrievalService.stop();
 		} catch (Exception e) {
-			log.error("An error occurred during stopping the webMonitorRetrievalService", e);
+			log.error("An error occurred during stopping the WebMonitorRetrievalService", e);
 		}
 
 		try {
-			dispatcherRetrievalService.stop();
+			clientHAServices.close();
 		} catch (Exception e) {
-			log.error("An error occurred during stopping the dispatcherLeaderRetriever", e);
+			log.error("An error occurred during stopping the ClientHighAvailabilityServices", e);
 		}
 
 		try {
-			// we only call this for legacy reasons to shutdown components that are started in the ClusterClient constructor
-			super.shutdown();
+			super.close();
 		} catch (Exception e) {
-			log.error("An error occurred during the client shutdown.", e);
+			log.error("Error while closing the Cluster Client", e);
 		}
 	}
 
@@ -244,7 +227,12 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 
 		if (isDetached()) {
 			try {
-				return jobSubmissionFuture.get();
+				final JobSubmissionResult jobSubmissionResult = jobSubmissionFuture.get();
+
+				log.warn("Job was executed in detached mode, the results will be available on completion.");
+
+				this.lastJobExecutionResult = new DetachedJobExecutionResult(jobSubmissionResult.getJobID());
+				return lastJobExecutionResult;
 			} catch (Exception e) {
 				throw new ProgramInvocationException("Could not submit job",
 					jobGraph.getJobID(), ExceptionUtils.stripExecutionException(e));
@@ -390,25 +378,42 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 	}
 
 	@Override
-	public void stop(JobID jobID) throws Exception {
-		JobTerminationMessageParameters params = new JobTerminationMessageParameters();
+	public void cancel(JobID jobID) throws Exception {
+		JobCancellationMessageParameters params = new JobCancellationMessageParameters();
 		params.jobPathParameter.resolve(jobID);
-		params.terminationModeQueryParameter.resolve(Collections.singletonList(TerminationModeQueryParameter.TerminationMode.STOP));
+		params.terminationModeQueryParameter.resolve(Collections.singletonList(TerminationModeQueryParameter.TerminationMode.CANCEL));
 		CompletableFuture<EmptyResponseBody> responseFuture = sendRequest(
-			JobTerminationHeaders.getInstance(),
+			JobCancellationHeaders.getInstance(),
 			params);
 		responseFuture.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
 	}
 
 	@Override
-	public void cancel(JobID jobID) throws Exception {
-		JobTerminationMessageParameters params = new JobTerminationMessageParameters();
-		params.jobPathParameter.resolve(jobID);
-		params.terminationModeQueryParameter.resolve(Collections.singletonList(TerminationModeQueryParameter.TerminationMode.CANCEL));
-		CompletableFuture<EmptyResponseBody> responseFuture = sendRequest(
-			JobTerminationHeaders.getInstance(),
-			params);
-		responseFuture.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+	public String stopWithSavepoint(
+			final JobID jobId,
+			final boolean advanceToEndOfTime,
+			@Nullable final String savepointDirectory) throws Exception {
+
+		final StopWithSavepointTriggerHeaders stopWithSavepointTriggerHeaders = StopWithSavepointTriggerHeaders.getInstance();
+
+		final SavepointTriggerMessageParameters stopWithSavepointTriggerMessageParameters =
+				stopWithSavepointTriggerHeaders.getUnresolvedMessageParameters();
+		stopWithSavepointTriggerMessageParameters.jobID.resolve(jobId);
+
+		final CompletableFuture<TriggerResponse> responseFuture = sendRequest(
+				stopWithSavepointTriggerHeaders,
+				stopWithSavepointTriggerMessageParameters,
+				new StopWithSavepointRequestBody(savepointDirectory, advanceToEndOfTime));
+
+		return responseFuture.thenCompose(savepointTriggerResponseBody -> {
+			final TriggerId savepointTriggerId = savepointTriggerResponseBody.getTriggerId();
+			return pollSavepointAsync(jobId, savepointTriggerId);
+		}).thenApply(savepointInfo -> {
+			if (savepointInfo.getFailureCause() != null) {
+				throw new CompletionException(savepointInfo.getFailureCause());
+			}
+			return savepointInfo.getLocation();
+		}).get();
 	}
 
 	@Override
@@ -517,50 +522,6 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 	}
 
 	@Override
-	public LeaderConnectionInfo getClusterConnectionInfo() throws LeaderRetrievalException {
-		return LeaderRetrievalUtils.retrieveLeaderConnectionInfo(
-			highAvailabilityServices.getDispatcherLeaderRetriever(),
-			timeout);
-	}
-
-	@Override
-	public CompletableFuture<Acknowledge> rescaleJob(JobID jobId, int newParallelism) {
-
-		final RescalingTriggerHeaders rescalingTriggerHeaders = RescalingTriggerHeaders.getInstance();
-		final RescalingTriggerMessageParameters rescalingTriggerMessageParameters = rescalingTriggerHeaders.getUnresolvedMessageParameters();
-		rescalingTriggerMessageParameters.jobPathParameter.resolve(jobId);
-		rescalingTriggerMessageParameters.rescalingParallelismQueryParameter.resolve(Collections.singletonList(newParallelism));
-
-		final CompletableFuture<TriggerResponse> rescalingTriggerResponseFuture = sendRequest(
-			rescalingTriggerHeaders,
-			rescalingTriggerMessageParameters);
-
-		final CompletableFuture<AsynchronousOperationInfo> rescalingOperationFuture = rescalingTriggerResponseFuture.thenCompose(
-			(TriggerResponse triggerResponse) -> {
-				final TriggerId triggerId = triggerResponse.getTriggerId();
-				final RescalingStatusHeaders rescalingStatusHeaders = RescalingStatusHeaders.getInstance();
-				final RescalingStatusMessageParameters rescalingStatusMessageParameters = rescalingStatusHeaders.getUnresolvedMessageParameters();
-
-				rescalingStatusMessageParameters.jobPathParameter.resolve(jobId);
-				rescalingStatusMessageParameters.triggerIdPathParameter.resolve(triggerId);
-
-				return pollResourceAsync(
-					() -> sendRequest(
-						rescalingStatusHeaders,
-						rescalingStatusMessageParameters));
-			});
-
-		return rescalingOperationFuture.thenApply(
-			(AsynchronousOperationInfo asynchronousOperationInfo) -> {
-				if (asynchronousOperationInfo.getFailureCause() == null) {
-					return Acknowledge.get();
-				} else {
-					throw new CompletionException(asynchronousOperationInfo.getFailureCause());
-				}
-			});
-	}
-
-	@Override
 	public CompletableFuture<Acknowledge> disposeSavepoint(String savepointPath) {
 		final SavepointDisposalRequest savepointDisposalRequest = new SavepointDisposalRequest(savepointPath);
 
@@ -646,16 +607,6 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 	// ======================================
 
 	@Override
-	public boolean hasUserJarsInClassPath(List<URL> userJarFiles) {
-		return false;
-	}
-
-	@Override
-	public void waitForClusterToBeReady() {
-		// no op
-	}
-
-	@Override
 	public String getWebInterfaceURL() {
 		try {
 			return getWebMonitorBaseUrl().get().toString();
@@ -665,21 +616,6 @@ public class RestClusterClient<T> extends ClusterClient<T> implements NewCluster
 			log.warn("Could not retrieve the web interface URL for the cluster.", e);
 			return "Unknown address.";
 		}
-	}
-
-	@Override
-	public GetClusterStatusResponse getClusterStatus() {
-		return null;
-	}
-
-	@Override
-	public List<String> getNewMessages() {
-		return Collections.emptyList();
-	}
-
-	@Override
-	public int getMaxSlots() {
-		return MAX_SLOTS_UNKNOWN;
 	}
 
 	//-------------------------------------------------------------------------

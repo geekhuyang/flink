@@ -58,14 +58,13 @@ public class AccumulatorErrorITCase extends TestLogger {
 
 	public static Configuration getConfiguration() {
 		Configuration config = new Configuration();
-		config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE, "12m");
+		config.setString(TaskManagerOptions.LEGACY_MANAGED_MEMORY_SIZE, "12m");
 		return config;
 	}
 
 	@Test
 	public void testFaultyAccumulator() throws Exception {
 		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-		env.getConfig().disableSysoutLogging();
 
 		// Test Exception forwarding with faulty Accumulator implementation
 		env.generateSequence(0, 10000)
@@ -78,8 +77,6 @@ public class AccumulatorErrorITCase extends TestLogger {
 	@Test
 	public void testInvalidTypeAccumulator() throws Exception {
 		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-
-		env.getConfig().disableSysoutLogging();
 
 		// Test Exception forwarding with faulty Accumulator implementation
 		env.generateSequence(0, 10000)
@@ -101,7 +98,6 @@ public class AccumulatorErrorITCase extends TestLogger {
 	@Test
 	public void testFaultyMergeAccumulator() throws Exception {
 		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-		env.getConfig().disableSysoutLogging();
 
 		// Test Exception forwarding with faulty Accumulator implementation
 		env.generateSequence(0, 10000)

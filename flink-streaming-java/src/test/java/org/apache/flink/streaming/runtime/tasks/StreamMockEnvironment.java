@@ -47,9 +47,13 @@ import org.apache.flink.runtime.operators.testutils.MockInputSplitProvider;
 import org.apache.flink.runtime.query.KvStateRegistry;
 import org.apache.flink.runtime.query.TaskKvStateRegistry;
 import org.apache.flink.runtime.state.TaskStateManager;
+import org.apache.flink.runtime.taskexecutor.GlobalAggregateManager;
+import org.apache.flink.runtime.taskexecutor.TestGlobalAggregateManager;
 import org.apache.flink.runtime.taskmanager.TaskManagerRuntimeInfo;
 import org.apache.flink.runtime.util.TestingTaskManagerRuntimeInfo;
 import org.apache.flink.util.Preconditions;
+
+import javax.annotation.Nullable;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -57,6 +61,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 
 import static org.junit.Assert.fail;
 import static org.mockito.Mockito.mock;
@@ -98,9 +103,14 @@ public class StreamMockEnvironment implements Environment {
 
 	private final TaskStateManager taskStateManager;
 
-	private volatile boolean wasFailedExternally = false;
+	private final GlobalAggregateManager aggregateManager;
+
+	@Nullable
+	private Consumer<Throwable> externalExceptionHandler;
 
 	private TaskEventDispatcher taskEventDispatcher = mock(TaskEventDispatcher.class);
+
+	private TaskManagerRuntimeInfo taskManagerRuntimeInfo = new TestingTaskManagerRuntimeInfo();
 
 	public StreamMockEnvironment(
 		Configuration jobConfig,
@@ -150,6 +160,7 @@ public class StreamMockEnvironment implements Environment {
 		this.memManager = new MemoryManager(memorySize, 1);
 		this.ioManager = new IOManagerAsync();
 		this.taskStateManager = Preconditions.checkNotNull(taskStateManager);
+		this.aggregateManager = new TestGlobalAggregateManager();
 		this.inputSplitProvider = inputSplitProvider;
 		this.bufferSize = bufferSize;
 
@@ -186,6 +197,10 @@ public class StreamMockEnvironment implements Environment {
 			t.printStackTrace();
 			fail(t.getMessage());
 		}
+	}
+
+	public void setExternalExceptionHandler(Consumer<Throwable> externalExceptionHandler) {
+		this.externalExceptionHandler = externalExceptionHandler;
 	}
 
 	@Override
@@ -286,6 +301,11 @@ public class StreamMockEnvironment implements Environment {
 	}
 
 	@Override
+	public GlobalAggregateManager getGlobalAggregateManager() {
+		return aggregateManager;
+	}
+
+	@Override
 	public AccumulatorRegistry getAccumulatorRegistry() {
 		return accumulatorRegistry;
 	}
@@ -313,16 +333,18 @@ public class StreamMockEnvironment implements Environment {
 
 	@Override
 	public void failExternally(Throwable cause) {
-		this.wasFailedExternally = true;
-	}
-
-	public boolean wasFailedExternally() {
-		return wasFailedExternally;
+		if (externalExceptionHandler != null) {
+			externalExceptionHandler.accept(cause);
+		}
 	}
 
 	@Override
 	public TaskManagerRuntimeInfo getTaskManagerInfo() {
-		return new TestingTaskManagerRuntimeInfo();
+		return this.taskManagerRuntimeInfo;
+	}
+
+	public void setTaskManagerInfo(TaskManagerRuntimeInfo taskManagerRuntimeInfo) {
+		this.taskManagerRuntimeInfo = taskManagerRuntimeInfo;
 	}
 
 	@Override

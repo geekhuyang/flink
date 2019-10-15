@@ -57,12 +57,13 @@ public class ConfigOptionsDocGenerator {
 
 	static final OptionsClassLocation[] LOCATIONS = new OptionsClassLocation[]{
 		new OptionsClassLocation("flink-core", "org.apache.flink.configuration"),
-		new OptionsClassLocation("flink-runtime", "org.apache.flink.runtime.io.network.netty"),
+		new OptionsClassLocation("flink-runtime", "org.apache.flink.runtime.shuffle"),
 		new OptionsClassLocation("flink-yarn", "org.apache.flink.yarn.configuration"),
 		new OptionsClassLocation("flink-mesos", "org.apache.flink.mesos.configuration"),
 		new OptionsClassLocation("flink-mesos", "org.apache.flink.mesos.runtime.clusterframework"),
 		new OptionsClassLocation("flink-metrics/flink-metrics-prometheus", "org.apache.flink.metrics.prometheus"),
-		new OptionsClassLocation("flink-state-backends/flink-statebackend-rocksdb", "org.apache.flink.contrib.streaming.state")
+		new OptionsClassLocation("flink-state-backends/flink-statebackend-rocksdb", "org.apache.flink.contrib.streaming.state"),
+		new OptionsClassLocation("flink-table/flink-table-api-java", "org.apache.flink.table.api.config")
 	};
 
 	static final Set<String> EXCLUSIONS = new HashSet<>(Arrays.asList(
@@ -260,10 +261,26 @@ public class ConfigOptionsDocGenerator {
 	private static String toHtmlString(final OptionWithMetaInfo optionWithMetaInfo) {
 		ConfigOption<?> option = optionWithMetaInfo.option;
 		String defaultValue = stringifyDefault(optionWithMetaInfo);
+		Documentation.TableOption tableOption = optionWithMetaInfo.field.getAnnotation(Documentation.TableOption.class);
+		StringBuilder execModeStringBuilder = new StringBuilder();
+		if (tableOption != null) {
+			Documentation.ExecMode execMode = tableOption.execMode();
+			if (Documentation.ExecMode.BATCH_STREAMING.equals(execMode)) {
+				execModeStringBuilder.append("<br> <span class=\"label label-primary\">")
+						.append(Documentation.ExecMode.BATCH.toString())
+						.append("</span> <span class=\"label label-primary\">")
+						.append(Documentation.ExecMode.STREAMING.toString())
+						.append("</span>");
+			} else {
+				execModeStringBuilder.append("<br> <span class=\"label label-primary\">")
+						.append(execMode.toString())
+						.append("</span>");
+			}
+		}
 
 		return "" +
 			"        <tr>\n" +
-			"            <td><h5>" + escapeCharacters(option.key()) + "</h5></td>\n" +
+			"            <td><h5>" + escapeCharacters(option.key()) + "</h5>" + execModeStringBuilder.toString() + "</td>\n" +
 			"            <td style=\"word-wrap: break-word;\">" + escapeCharacters(addWordBreakOpportunities(defaultValue)) + "</td>\n" +
 			"            <td>" + formatter.format(option.description()) + "</td>\n" +
 			"        </tr>\n";
@@ -332,11 +349,20 @@ public class ConfigOptionsDocGenerator {
 
 		private Node findGroupRoot(String key) {
 			String[] keyComponents = key.split("\\.");
+			Node lastRootNode = root;
 			Node currentNode = root;
 			for (String keyComponent : keyComponents) {
-				currentNode = currentNode.findChild(keyComponent);
+				final Node childNode = currentNode.getChild(keyComponent);
+				if (childNode == null) {
+					break;
+				} else {
+					currentNode = childNode;
+					if (currentNode.isGroupRoot()) {
+						lastRootNode = currentNode;
+					}
+				}
 			}
-			return currentNode.isGroupRoot() ? currentNode : root;
+			return lastRootNode;
 		}
 
 		private static class Node {
@@ -353,12 +379,8 @@ public class ConfigOptionsDocGenerator {
 				return child;
 			}
 
-			private Node findChild(String keyComponent) {
-				Node child = children.get(keyComponent);
-				if (child == null) {
-					return this;
-				}
-				return child;
+			private Node getChild(String keyComponent) {
+				return children.get(keyComponent);
 			}
 
 			private void assignOption(OptionWithMetaInfo option) {

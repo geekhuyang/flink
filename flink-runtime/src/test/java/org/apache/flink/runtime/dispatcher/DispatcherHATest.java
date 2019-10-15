@@ -30,8 +30,7 @@ import org.apache.flink.runtime.highavailability.TestingHighAvailabilityServices
 import org.apache.flink.runtime.highavailability.TestingHighAvailabilityServicesBuilder;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobmanager.SubmittedJobGraph;
-import org.apache.flink.runtime.jobmanager.SubmittedJobGraphStore;
+import org.apache.flink.runtime.jobmanager.JobGraphStore;
 import org.apache.flink.runtime.leaderelection.TestingLeaderElectionService;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup;
@@ -43,8 +42,9 @@ import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.RpcUtils;
 import org.apache.flink.runtime.rpc.TestingRpcService;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
-import org.apache.flink.runtime.testutils.InMemorySubmittedJobGraphStore;
+import org.apache.flink.runtime.testutils.TestingJobGraphStore;
 import org.apache.flink.runtime.util.TestingFatalErrorHandler;
+import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.Preconditions;
@@ -59,6 +59,7 @@ import org.junit.Test;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Queue;
@@ -77,7 +78,6 @@ import static org.junit.Assert.assertThat;
  * Tests the HA behaviour of the {@link Dispatcher}.
  */
 public class DispatcherHATest extends TestLogger {
-
 	private static final DispatcherId NULL_FENCING_TOKEN = DispatcherId.fromUuid(new UUID(0L, 0L));
 
 	private static final Time timeout = Time.seconds(10L);
@@ -119,11 +119,10 @@ public class DispatcherHATest extends TestLogger {
 	public void testGrantingRevokingLeadership() throws Exception {
 		final TestingHighAvailabilityServices highAvailabilityServices = new TestingHighAvailabilityServices();
 		final JobGraph nonEmptyJobGraph = createNonEmptyJobGraph();
-		final SubmittedJobGraph submittedJobGraph = new SubmittedJobGraph(nonEmptyJobGraph);
 
 		final OneShotLatch enterGetJobIdsLatch = new OneShotLatch();
 		final OneShotLatch proceedGetJobIdsLatch = new OneShotLatch();
-		highAvailabilityServices.setSubmittedJobGraphStore(new BlockingSubmittedJobGraphStore(submittedJobGraph, enterGetJobIdsLatch, proceedGetJobIdsLatch));
+		highAvailabilityServices.setJobGraphStore(new BlockingJobGraphStore(nonEmptyJobGraph, enterGetJobIdsLatch, proceedGetJobIdsLatch));
 		final TestingLeaderElectionService dispatcherLeaderElectionService = new TestingLeaderElectionService();
 		highAvailabilityServices.setDispatcherLeaderElectionService(dispatcherLeaderElectionService);
 
@@ -134,6 +133,9 @@ public class DispatcherHATest extends TestLogger {
 		dispatcher.start();
 
 		try {
+			// wait until the election service has been started
+			dispatcherLeaderElectionService.getStartFuture().get();
+
 			final UUID leaderId = UUID.randomUUID();
 			dispatcherLeaderElectionService.isLeader(leaderId);
 
@@ -205,18 +207,19 @@ public class DispatcherHATest extends TestLogger {
 	 */
 	@Test
 	public void testJobRecoveryWhenChangingLeadership() throws Exception {
-		final InMemorySubmittedJobGraphStore submittedJobGraphStore = new InMemorySubmittedJobGraphStore();
-
 		final CompletableFuture<JobID> recoveredJobFuture = new CompletableFuture<>();
-		submittedJobGraphStore.setRecoverJobGraphFunction((jobID, jobIDSubmittedJobGraphMap) -> {
-			recoveredJobFuture.complete(jobID);
-			return jobIDSubmittedJobGraphMap.get(jobID);
-		});
+		final TestingJobGraphStore submittedJobGraphStore = TestingJobGraphStore.newBuilder()
+			.setRecoverJobGraphFunction(
+				(jobID, jobIDSubmittedJobGraphMap) -> {
+					recoveredJobFuture.complete(jobID);
+					return jobIDSubmittedJobGraphMap.get(jobID);
+				})
+			.build();
 
 		final TestingLeaderElectionService leaderElectionService = new TestingLeaderElectionService();
 
 		final TestingHighAvailabilityServices highAvailabilityServices = new TestingHighAvailabilityServicesBuilder()
-			.setSubmittedJobGraphStore(submittedJobGraphStore)
+			.setJobGraphStore(submittedJobGraphStore)
 			.setDispatcherLeaderElectionService(leaderElectionService)
 			.build();
 
@@ -270,7 +273,7 @@ public class DispatcherHATest extends TestLogger {
 		final String exceptionMessage = "Job recovery test failure.";
 		final Supplier<Exception> exceptionSupplier = () -> new FlinkException(exceptionMessage);
 		final TestingHighAvailabilityServices haServices = new TestingHighAvailabilityServicesBuilder()
-			.setSubmittedJobGraphStore(new FailingSubmittedJobGraphStore(exceptionSupplier))
+			.setJobGraphStore(new FailingJobGraphStore(exceptionSupplier))
 			.build();
 
 		final HATestingDispatcher dispatcher = createDispatcher(haServices);
@@ -290,34 +293,30 @@ public class DispatcherHATest extends TestLogger {
 
 	@Nonnull
 	private TestingJobManagerRunnerFactory createTestingJobManagerRunnerFactory() {
-		return new TestingJobManagerRunnerFactory(new CompletableFuture<>(), new CompletableFuture<>(), CompletableFuture.completedFuture(null));
-	}
-
-	@Nonnull
-	private HATestingDispatcher createDispatcherWithJobManagerRunnerFactory(HighAvailabilityServices highAvailabilityServices, Dispatcher.JobManagerRunnerFactory jobManagerRunnerFactory) throws Exception {
-		return createDispatcher(highAvailabilityServices, null, jobManagerRunnerFactory);
+		return new TestingJobManagerRunnerFactory();
 	}
 
 	private HATestingDispatcher createDispatcher(HighAvailabilityServices haServices) throws Exception {
 		return createDispatcher(
 			haServices,
-			null,
+			new ArrayDeque<>(1),
 			createTestingJobManagerRunnerFactory());
 	}
 
 	@Nonnull
 	private HATestingDispatcher createDispatcher(
 		HighAvailabilityServices highAvailabilityServices,
-		@Nullable Queue<DispatcherId> fencingTokens,
-		Dispatcher.JobManagerRunnerFactory jobManagerRunnerFactory) throws Exception {
+		@Nonnull Queue<DispatcherId> fencingTokens,
+		JobManagerRunnerFactory jobManagerRunnerFactory) throws Exception {
 		final Configuration configuration = new Configuration();
 
+		TestingResourceManagerGateway resourceManagerGateway = new TestingResourceManagerGateway();
 		return new HATestingDispatcher(
 			rpcService,
 			UUID.randomUUID().toString(),
 			configuration,
 			highAvailabilityServices,
-			new TestingResourceManagerGateway(),
+			() -> CompletableFuture.completedFuture(resourceManagerGateway),
 			new BlobServer(configuration, new VoidBlobStore()),
 			new HeartbeatServices(1000L, 1000L),
 			UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup(),
@@ -329,7 +328,7 @@ public class DispatcherHATest extends TestLogger {
 	}
 
 	@Nonnull
-	public static JobGraph createNonEmptyJobGraph() {
+	static JobGraph createNonEmptyJobGraph() {
 		final JobVertex noOpVertex = new JobVertex("NoOp vertex");
 		noOpVertex.setInvokableClass(NoOpInvokable.class);
 		final JobGraph jobGraph = new JobGraph(noOpVertex);
@@ -348,11 +347,11 @@ public class DispatcherHATest extends TestLogger {
 				String endpointId,
 				Configuration configuration,
 				HighAvailabilityServices highAvailabilityServices,
-				ResourceManagerGateway resourceManagerGateway,
+				GatewayRetriever<ResourceManagerGateway> resourceManagerGatewayRetriever,
 				BlobServer blobServer,
 				HeartbeatServices heartbeatServices,
 				JobManagerMetricGroup jobManagerMetricGroup,
-				@Nullable String metricQueryServicePath,
+				@Nullable String metricQueryServiceAddress,
 				ArchivedExecutionGraphStore archivedExecutionGraphStore,
 				JobManagerRunnerFactory jobManagerRunnerFactory,
 				FatalErrorHandler fatalErrorHandler,
@@ -362,11 +361,11 @@ public class DispatcherHATest extends TestLogger {
 				endpointId,
 				configuration,
 				highAvailabilityServices,
-				resourceManagerGateway,
+				resourceManagerGatewayRetriever,
 				blobServer,
 				heartbeatServices,
 				jobManagerMetricGroup,
-				metricQueryServicePath,
+				metricQueryServiceAddress,
 				archivedExecutionGraphStore,
 				jobManagerRunnerFactory,
 				fatalErrorHandler);
@@ -388,10 +387,10 @@ public class DispatcherHATest extends TestLogger {
 		}
 	}
 
-	private static class BlockingSubmittedJobGraphStore implements SubmittedJobGraphStore {
+	private static class BlockingJobGraphStore implements JobGraphStore {
 
 		@Nonnull
-		private final SubmittedJobGraph submittedJobGraph;
+		private final JobGraph jobGraph;
 
 		@Nonnull
 		private final OneShotLatch enterGetJobIdsLatch;
@@ -399,95 +398,91 @@ public class DispatcherHATest extends TestLogger {
 		@Nonnull
 		private final OneShotLatch proceedGetJobIdsLatch;
 
-		private boolean isStarted = false;
-
-		private BlockingSubmittedJobGraphStore(@Nonnull SubmittedJobGraph submittedJobGraph, @Nonnull OneShotLatch enterGetJobIdsLatch, @Nonnull OneShotLatch proceedGetJobIdsLatch) {
-			this.submittedJobGraph = submittedJobGraph;
+		private BlockingJobGraphStore(@Nonnull JobGraph jobGraph, @Nonnull OneShotLatch enterGetJobIdsLatch, @Nonnull OneShotLatch proceedGetJobIdsLatch) {
+			this.jobGraph = jobGraph;
 			this.enterGetJobIdsLatch = enterGetJobIdsLatch;
 			this.proceedGetJobIdsLatch = proceedGetJobIdsLatch;
 		}
 
 		@Override
-		public void start(SubmittedJobGraphListener jobGraphListener) throws Exception {
-			isStarted = true;
+		public void start(JobGraphListener jobGraphListener) {
 		}
 
 		@Override
-		public void stop() throws Exception {
-			isStarted = false;
+		public void stop() {
 		}
 
 		@Nullable
 		@Override
-		public SubmittedJobGraph recoverJobGraph(JobID jobId) throws Exception {
-			Preconditions.checkArgument(jobId.equals(submittedJobGraph.getJobId()));
+		public JobGraph recoverJobGraph(JobID jobId) {
+			Preconditions.checkArgument(jobId.equals(jobGraph.getJobID()));
 
-			return submittedJobGraph;
+			return jobGraph;
 		}
 
 		@Override
-		public void putJobGraph(SubmittedJobGraph jobGraph) throws Exception {
+		public void putJobGraph(JobGraph jobGraph) {
 			throw new UnsupportedOperationException("Should not be called.");
 		}
 
 		@Override
-		public void removeJobGraph(JobID jobId) throws Exception {
+		public void removeJobGraph(JobID jobId) {
 			throw new UnsupportedOperationException("Should not be called.");
 		}
 
 		@Override
-		public void releaseJobGraph(JobID jobId) throws Exception {}
+		public void releaseJobGraph(JobID jobId) {}
 
 		@Override
 		public Collection<JobID> getJobIds() throws Exception {
 			enterGetJobIdsLatch.trigger();
 			proceedGetJobIdsLatch.await();
-			return Collections.singleton(submittedJobGraph.getJobId());
+			return Collections.singleton(jobGraph.getJobID());
 		}
 	}
 
-	private static class FailingSubmittedJobGraphStore implements SubmittedJobGraphStore {
+	private static class FailingJobGraphStore implements JobGraphStore {
 		private final JobID jobId = new JobID();
 
 		private final Supplier<Exception> exceptionSupplier;
 
-		private FailingSubmittedJobGraphStore(Supplier<Exception> exceptionSupplier) {
+		private FailingJobGraphStore(Supplier<Exception> exceptionSupplier) {
 			this.exceptionSupplier = exceptionSupplier;
 		}
 
 		@Override
-		public void start(SubmittedJobGraphListener jobGraphListener) throws Exception {
+		public void start(JobGraphListener jobGraphListener) {
 
 		}
 
 		@Override
-		public void stop() throws Exception {
+		public void stop() {
 
 		}
 
 		@Nullable
 		@Override
-		public SubmittedJobGraph recoverJobGraph(JobID jobId) throws Exception {
+		public JobGraph recoverJobGraph(JobID jobId) throws Exception {
 			throw exceptionSupplier.get();
 		}
 
 		@Override
-		public void putJobGraph(SubmittedJobGraph jobGraph) throws Exception {
+		public void putJobGraph(JobGraph jobGraph) {
 
 		}
 
 		@Override
-		public void removeJobGraph(JobID jobId) throws Exception {
+		public void removeJobGraph(JobID jobId) {
 
 		}
 
 		@Override
-		public void releaseJobGraph(JobID jobId) throws Exception {
+		public void releaseJobGraph(JobID jobId) {
 
 		}
 
 		@Override
-		public Collection<JobID> getJobIds() throws Exception {
+		public Collection<JobID> getJobIds() {
 			return Collections.singleton(jobId);
 		}
 	}

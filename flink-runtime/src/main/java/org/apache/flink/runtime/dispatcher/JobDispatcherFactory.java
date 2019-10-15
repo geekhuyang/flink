@@ -19,25 +19,19 @@
 package org.apache.flink.runtime.dispatcher;
 
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.entrypoint.ClusterEntrypoint;
 import org.apache.flink.runtime.entrypoint.component.JobGraphRetriever;
-import org.apache.flink.runtime.heartbeat.HeartbeatServices;
-import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.jobgraph.JobGraph;
-import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup;
-import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
-import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcService;
 
-import javax.annotation.Nullable;
+import javax.annotation.Nonnull;
 
 import static org.apache.flink.runtime.entrypoint.ClusterEntrypoint.EXECUTION_MODE;
 
 /**
  * {@link DispatcherFactory} which creates a {@link MiniDispatcher}.
  */
-public class JobDispatcherFactory implements DispatcherFactory<MiniDispatcher> {
+public class JobDispatcherFactory implements DispatcherFactory {
 
 	private final JobGraphRetriever jobGraphRetriever;
 
@@ -47,17 +41,9 @@ public class JobDispatcherFactory implements DispatcherFactory<MiniDispatcher> {
 
 	@Override
 	public MiniDispatcher createDispatcher(
-			Configuration configuration,
-			RpcService rpcService,
-			HighAvailabilityServices highAvailabilityServices,
-			ResourceManagerGateway resourceManagerGateway,
-			BlobServer blobServer,
-			HeartbeatServices heartbeatServices,
-			JobManagerMetricGroup jobManagerMetricGroup,
-			@Nullable String metricQueryServicePath,
-			ArchivedExecutionGraphStore archivedExecutionGraphStore,
-			FatalErrorHandler fatalErrorHandler,
-			HistoryServerArchivist historyServerArchivist) throws Exception {
+			@Nonnull RpcService rpcService,
+			@Nonnull PartialDispatcherServices partialDispatcherServices) throws Exception {
+		final Configuration configuration = partialDispatcherServices.getConfiguration();
 		final JobGraph jobGraph = jobGraphRetriever.retrieveJobGraph(configuration);
 
 		final String executionModeValue = configuration.getString(EXECUTION_MODE);
@@ -66,18 +52,8 @@ public class JobDispatcherFactory implements DispatcherFactory<MiniDispatcher> {
 
 		return new MiniDispatcher(
 			rpcService,
-			Dispatcher.DISPATCHER_NAME,
-			configuration,
-			highAvailabilityServices,
-			resourceManagerGateway,
-			blobServer,
-			heartbeatServices,
-			jobManagerMetricGroup,
-			metricQueryServicePath,
-			archivedExecutionGraphStore,
-			Dispatcher.DefaultJobManagerRunnerFactory.INSTANCE,
-			fatalErrorHandler,
-			historyServerArchivist,
+			getEndpointId(),
+			DispatcherServices.from(partialDispatcherServices, DefaultJobManagerRunnerFactory.INSTANCE),
 			jobGraph,
 			executionMode);
 	}

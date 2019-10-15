@@ -29,6 +29,7 @@ import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -41,34 +42,51 @@ import java.util.function.Function;
  */
 class TestingDispatcher extends Dispatcher {
 
+	private final CompletableFuture<Void> startFuture;
+
 	TestingDispatcher(
 		RpcService rpcService,
 		String endpointId,
 		Configuration configuration,
 		HighAvailabilityServices highAvailabilityServices,
-		ResourceManagerGateway resourceManagerGateway,
+		GatewayRetriever<ResourceManagerGateway> resourceManagerGatewayRetriever,
 		BlobServer blobServer,
 		HeartbeatServices heartbeatServices,
 		JobManagerMetricGroup jobManagerMetricGroup,
-		@Nullable String metricQueryServicePath,
+		@Nullable String metricQueryServiceAddress,
 		ArchivedExecutionGraphStore archivedExecutionGraphStore,
 		JobManagerRunnerFactory jobManagerRunnerFactory,
 		FatalErrorHandler fatalErrorHandler) throws Exception {
 		super(
 			rpcService,
 			endpointId,
-			configuration,
-			highAvailabilityServices,
-			highAvailabilityServices.getSubmittedJobGraphStore(),
-			resourceManagerGateway,
-			blobServer,
-			heartbeatServices,
-			jobManagerMetricGroup,
-			metricQueryServicePath,
-			archivedExecutionGraphStore,
-			jobManagerRunnerFactory,
-			fatalErrorHandler,
-			VoidHistoryServerArchivist.INSTANCE);
+			new DispatcherServices(
+				configuration,
+				highAvailabilityServices,
+				resourceManagerGatewayRetriever,
+				blobServer,
+				heartbeatServices,
+				jobManagerMetricGroup,
+				archivedExecutionGraphStore,
+				fatalErrorHandler,
+				VoidHistoryServerArchivist.INSTANCE,
+				metricQueryServiceAddress,
+				jobManagerRunnerFactory),
+			highAvailabilityServices.getJobGraphStore());
+
+		this.startFuture = new CompletableFuture<>();
+	}
+
+	@Override
+	public void onStart() throws Exception {
+		try {
+			super.onStart();
+		} catch (Exception e) {
+			startFuture.completeExceptionally(e);
+			throw e;
+		}
+
+		startFuture.complete(null);
 	}
 
 	void completeJobExecution(ArchivedExecutionGraph archivedExecutionGraph) {
@@ -92,5 +110,9 @@ class TestingDispatcher extends Dispatcher {
 		return callAsyncWithoutFencing(
 			() -> listJobs(timeout).get().size(),
 			timeout);
+	}
+
+	void waitUntilStarted() {
+		startFuture.join();
 	}
 }

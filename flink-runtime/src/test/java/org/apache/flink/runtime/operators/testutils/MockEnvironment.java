@@ -44,6 +44,7 @@ import org.apache.flink.runtime.metrics.groups.TaskMetricGroup;
 import org.apache.flink.runtime.query.KvStateRegistry;
 import org.apache.flink.runtime.query.TaskKvStateRegistry;
 import org.apache.flink.runtime.state.TaskStateManager;
+import org.apache.flink.runtime.taskexecutor.GlobalAggregateManager;
 import org.apache.flink.runtime.taskmanager.TaskManagerRuntimeInfo;
 import org.apache.flink.types.Record;
 import org.apache.flink.util.MutableObjectIterator;
@@ -65,9 +66,9 @@ import static org.junit.Assert.fail;
  * IMPORTANT! Remember to close environment after usage!
  */
 public class MockEnvironment implements Environment, AutoCloseable {
-	
+
 	private final TaskInfo taskInfo;
-	
+
 	private final ExecutionConfig executionConfig;
 
 	private final MemoryManager memManager;
@@ -75,6 +76,8 @@ public class MockEnvironment implements Environment, AutoCloseable {
 	private final IOManager ioManager;
 
 	private final TaskStateManager taskStateManager;
+
+	private final GlobalAggregateManager aggregateManager;
 
 	private final InputSplitProvider inputSplitProvider;
 
@@ -104,9 +107,9 @@ public class MockEnvironment implements Environment, AutoCloseable {
 
 	private final TaskEventDispatcher taskEventDispatcher = new TaskEventDispatcher();
 
-	private Optional<Class<Throwable>> expectedExternalFailureCause = Optional.empty();
+	private Optional<Class<? extends Throwable>> expectedExternalFailureCause = Optional.empty();
 
-	private Optional<Throwable> actualExternalFailureCause = Optional.empty();
+	private Optional<? extends Throwable> actualExternalFailureCause = Optional.empty();
 
 	private final TaskMetricGroup taskMetricGroup;
 
@@ -124,6 +127,7 @@ public class MockEnvironment implements Environment, AutoCloseable {
 		Configuration taskConfiguration,
 		ExecutionConfig executionConfig,
 		TaskStateManager taskStateManager,
+		GlobalAggregateManager aggregateManager,
 		int maxParallelism,
 		int parallelism,
 		int subtaskIndex,
@@ -155,10 +159,10 @@ public class MockEnvironment implements Environment, AutoCloseable {
 
 		this.userCodeClassLoader = Preconditions.checkNotNull(userCodeClassLoader);
 		this.taskStateManager = Preconditions.checkNotNull(taskStateManager);
+		this.aggregateManager = Preconditions.checkNotNull(aggregateManager);
 
 		this.taskMetricGroup = taskMetricGroup;
 	}
-
 
 	public IteratorWrappingTestSingleInputGate<Record> addInput(MutableObjectIterator<Record> inputIterator) {
 		try {
@@ -291,6 +295,11 @@ public class MockEnvironment implements Environment, AutoCloseable {
 	}
 
 	@Override
+	public GlobalAggregateManager getGlobalAggregateManager() {
+		return aggregateManager;
+	}
+
+	@Override
 	public AccumulatorRegistry getAccumulatorRegistry() {
 		return this.accumulatorRegistry;
 	}
@@ -326,23 +335,21 @@ public class MockEnvironment implements Environment, AutoCloseable {
 	}
 
 	@Override
-	public void close() {
+	public void close() throws Exception {
 		// close() method should be idempotent and calling memManager.verifyEmpty() will throw after it was shutdown.
 		if (!memManager.isShutdown()) {
 			checkState(memManager.verifyEmpty(), "Memory Manager managed memory was not completely freed.");
 		}
 
 		memManager.shutdown();
-		ioManager.shutdown();
-
-		checkState(ioManager.isProperlyShutDown(), "IO Manager has not properly shut down.");
+		ioManager.close();
 	}
 
-	public void setExpectedExternalFailureCause(Class<Throwable> expectedThrowableClass) {
+	public void setExpectedExternalFailureCause(Class<? extends Throwable> expectedThrowableClass) {
 		this.expectedExternalFailureCause = Optional.of(expectedThrowableClass);
 	}
 
-	public Optional<Throwable> getActualExternalFailureCause() {
+	public Optional<? extends Throwable> getActualExternalFailureCause() {
 		return actualExternalFailureCause;
 	}
 }

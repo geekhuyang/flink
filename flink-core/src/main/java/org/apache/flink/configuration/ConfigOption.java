@@ -23,6 +23,8 @@ import org.apache.flink.configuration.description.Description;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -116,10 +118,13 @@ public class ConfigOption<T> {
 	 * @return A new config options, with the given fallback keys.
 	 */
 	public ConfigOption<T> withFallbackKeys(String... fallbackKeys) {
-		FallbackKey[] fallbackKeyArray = Arrays.stream(fallbackKeys)
-			.map(FallbackKey::createFallbackKey)
+		final Stream<FallbackKey> newFallbackKeys = Arrays.stream(fallbackKeys).map(FallbackKey::createFallbackKey);
+		final Stream<FallbackKey> currentAlternativeKeys = Arrays.stream(this.fallbackKeys);
+
+		// put fallback keys first so that they are prioritized
+		final FallbackKey[] mergedAlternativeKeys = Stream.concat(newFallbackKeys, currentAlternativeKeys)
 			.toArray(FallbackKey[]::new);
-		return new ConfigOption<>(key, description, defaultValue, fallbackKeyArray);
+		return new ConfigOption<>(key, description, defaultValue, mergedAlternativeKeys);
 	}
 
 	/**
@@ -134,10 +139,13 @@ public class ConfigOption<T> {
 	 * @return A new config options, with the given deprecated keys.
 	 */
 	public ConfigOption<T> withDeprecatedKeys(String... deprecatedKeys) {
-		FallbackKey[] fallbackKeys = Arrays.stream(deprecatedKeys)
-			.map(FallbackKey::createDeprecatedKey)
+		final Stream<FallbackKey> newDeprecatedKeys = Arrays.stream(deprecatedKeys).map(FallbackKey::createDeprecatedKey);
+		final Stream<FallbackKey> currentAlternativeKeys = Arrays.stream(this.fallbackKeys);
+
+		// put deprecated keys last so that they are de-prioritized
+		final FallbackKey[] mergedAlternativeKeys = Stream.concat(currentAlternativeKeys, newDeprecatedKeys)
 			.toArray(FallbackKey[]::new);
-		return new ConfigOption<>(key, description, defaultValue, fallbackKeys);
+		return new ConfigOption<>(key, description, defaultValue, mergedAlternativeKeys);
 	}
 
 	/**
@@ -186,6 +194,31 @@ public class ConfigOption<T> {
 	 */
 	public T defaultValue() {
 		return defaultValue;
+	}
+
+	/**
+	 * Checks whether this option has deprecated keys.
+	 * @return True if the option has deprecated keys, false if not.
+	 * @deprecated Replaced by {@link #hasFallbackKeys()}
+	 */
+	@Deprecated
+	public boolean hasDeprecatedKeys() {
+		return fallbackKeys == EMPTY ? false :
+			Arrays.stream(fallbackKeys).anyMatch(FallbackKey::isDeprecated);
+	}
+
+	/**
+	 * Gets the deprecated keys, in the order to be checked.
+	 * @return The option's deprecated keys.
+	 * @deprecated Replaced by {@link #fallbackKeys()}
+	 */
+	@Deprecated
+	public Iterable<String> deprecatedKeys() {
+		return fallbackKeys == EMPTY ? Collections.<String>emptyList() :
+			Arrays.stream(fallbackKeys)
+				.filter(FallbackKey::isDeprecated)
+				.map(FallbackKey::getKey)
+				.collect(Collectors.toList());
 	}
 
 	/**

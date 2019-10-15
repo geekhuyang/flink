@@ -135,7 +135,7 @@ public class AsyncCallsTest extends TestLogger {
 			// validate that no concurrent access happened
 			assertFalse("Rpc Endpoint had concurrent access", concurrentAccess.get());
 		} finally {
-			rpcEndpoint.shutDown();
+			RpcUtils.terminateRpcEndpoint(rpcEndpoint, timeout);
 		}
 	}
 
@@ -320,8 +320,7 @@ public class AsyncCallsTest extends TestLogger {
 
 			return result;
 		} finally {
-			fencedTestEndpoint.shutDown();
-			fencedTestEndpoint.getTerminationFuture().get(timeout.toMilliseconds(), TimeUnit.MILLISECONDS);
+			RpcUtils.terminateRpcEndpoint(fencedTestEndpoint, timeout);
 		}
 	}
 
@@ -366,11 +365,6 @@ public class AsyncCallsTest extends TestLogger {
 			} else {
 				concurrentAccess.set(true);
 			}
-		}
-
-		@Override
-		public CompletableFuture<Void> postStop() {
-			return CompletableFuture.completedFuture(null);
 		}
 	}
 
@@ -420,22 +414,13 @@ public class AsyncCallsTest extends TestLogger {
 				UUID initialFencingToken,
 				OneShotLatch enteringSetNewFencingToken,
 				OneShotLatch triggerSetNewFencingToken) {
-			super(rpcService);
+			super(rpcService, initialFencingToken);
 
 			this.lock = lock;
 			this.concurrentAccess = concurrentAccess;
 
 			this.enteringSetNewFencingToken = enteringSetNewFencingToken;
 			this.triggerSetNewFencingToken = triggerSetNewFencingToken;
-
-			// make it look as if we are running in the main thread
-			currentMainThread.set(Thread.currentThread());
-
-			try {
-				setFencingToken(initialFencingToken);
-			} finally {
-				currentMainThread.set(null);
-			}
 		}
 
 		@Override
@@ -450,11 +435,6 @@ public class AsyncCallsTest extends TestLogger {
 			setFencingToken(fencingToken);
 
 			return CompletableFuture.completedFuture(Acknowledge.get());
-		}
-
-		@Override
-		public CompletableFuture<Void> postStop() {
-			return CompletableFuture.completedFuture(null);
 		}
 
 		@Override
